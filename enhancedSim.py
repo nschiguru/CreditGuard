@@ -6,20 +6,34 @@ import datetime
 import math
 import os
 import boto3
-import google.generativeai as genai # Import Gemini
-import re # Import regular expressions for parsing
+import google.generativeai as genai
+import re
 from dotenv import load_dotenv
 
-# --- Default Configuration (These can be overridden by Gemini) ---
+# this is default values for the simulation parameters
+# transaction from unusual location (ip address tracking)
+# high value purchases
+# out of character spending (sentiment analysis)
+# rapid speed purchases
+# multiple small transactions to test if the card words
+
 DEFAULT_CONFIG = {
+    # scale
     "NUM_CARDS": 50,
     "NUM_TRANSACTIONS": 1500,
+    # generated data location
     "OUTPUT_FILENAME": 'simulated_transactions_auto_tuned.jsonl',
+    # time between transactions
     "AVG_TRANSACTION_DELAY_SECONDS": 0.1,
+    # probability that a card is "compromised" already
     "COMPROMISE_CARD_PROBABILITY": 0.15,
+    # chance that next transaction is fraud when card is "compromised"
     "FRAUD_INJECTION_PROBABILITY": 0.05,
+    # small test transactions
     "PERFORM_TEST_TXN_PROB": 0.20,
+    # testing less suspicious speed cases of fraud
     "ATTEMPT_NEAR_MISS_VELOCITY_PROB": 0.30,
+    # multiple small transactions
     "FRAUD_TEST_AMOUNT_RANGE": (1.00, 15.00),
     "FRAUD_MAIN_AMOUNT_RANGE": (150.00, 2500.00),
     "NORMAL_AMOUNT_RANGE": (5.00, 250.00),
