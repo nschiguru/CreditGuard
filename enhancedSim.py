@@ -6,41 +6,33 @@ import datetime
 import math
 import os
 import boto3
-import google.generativeai as genai
-import re
+import google.generativeai as genai # Import Gemini
+import re # Import regular expressions for parsing
 from dotenv import load_dotenv
 
-# this is default values for the simulation parameters
-# transaction from unusual location (ip address tracking)
-# high value purchases
-# out of character spending (sentiment analysis)
-# rapid speed purchases
-# multiple small transactions to test if the card words
-
+# --- Default Configuration (with Overlap Modifications) ---
 DEFAULT_CONFIG = {
-    # scale
     "NUM_CARDS": 50,
-    "NUM_TRANSACTIONS": 1500,
-    # generated data location
-    "OUTPUT_FILENAME": 'simulated_transactions_auto_tuned.jsonl',
-    # time between transactions
+    "NUM_TRANSACTIONS": 10000, # Keep larger size
+    "OUTPUT_FILENAME": 'simulated_transactions_harder.jsonl', # New name
     "AVG_TRANSACTION_DELAY_SECONDS": 0.1,
-    # probability that a card is "compromised" already
     "COMPROMISE_CARD_PROBABILITY": 0.15,
-    # chance that next transaction is fraud when card is "compromised"
-    "FRAUD_INJECTION_PROBABILITY": 0.05,
-    # small test transactions
-    "PERFORM_TEST_TXN_PROB": 0.20,
-    # testing less suspicious speed cases of fraud
+    "FRAUD_INJECTION_PROBABILITY": 0.08, # Slightly increased
+    "PERFORM_TEST_TXN_PROB": 0.15,    # Slightly less frequent test txns
     "ATTEMPT_NEAR_MISS_VELOCITY_PROB": 0.30,
-    # multiple small transactions
-    "FRAUD_TEST_AMOUNT_RANGE": (1.00, 15.00),
-    "FRAUD_MAIN_AMOUNT_RANGE": (150.00, 2500.00),
-    "NORMAL_AMOUNT_RANGE": (5.00, 250.00),
-    "LOCATION_VARIATION_KM_NORMAL": 50,
-    "DISTANCE_THRESHOLD_KM": 500,
-    "VELOCITY_THRESHOLD_KMH": 800,
-    "LOCATION_VARIATION_KM_FRAUD": 5000,
+
+    "FRAUD_TEST_AMOUNT_RANGE": (1.00, 50.00),      # Test transactions can overlap normal
+    "FRAUD_MAIN_AMOUNT_RANGE": (50.00, 600.00),    # << MAIN FRAUD OVERLAPS NORMAL SIGNIFICANTLY
+    "NORMAL_AMOUNT_RANGE": (5.00, 400.00),      # << NORMAL GOES HIGHER
+
+    "LOCATION_VARIATION_KM_NORMAL_BASE": 75,     # << Base distance for normal (reduced from 200)
+    "PROB_NORMAL_IS_FARTHER": 0.05,             # << 5% chance normal goes farther
+    "LOCATION_VARIATION_KM_NORMAL_FARTHER": 300, # << How far 'farther normal' goes (overlaps fraud zone slightly)
+    "PROB_FRAUD_IS_CLOSER": 0.20,               # << 20% chance main fraud is closer
+    "DISTANCE_THRESHOLD_KM": 500,                # Detection rule assumption
+    "VELOCITY_THRESHOLD_KMH": 800,               # Detection rule assumption
+    "LOCATION_VARIATION_KM_FRAUD_MAX": 5000,     # Max distance for obvious fraud
+
     "SEND_TO_KINESIS": False,
     "KINESIS_STREAM_NAME": os.environ.get('KINESIS_STREAM_NAME', 'credit-guard-pipeline-dev-transaction-stream')
 }
@@ -49,120 +41,48 @@ DEFAULT_CONFIG = {
 config = DEFAULT_CONFIG.copy()
 
 # --- Gemini API Key ---
-# !! Store securely (e.g., environment variable, Secrets Manager) !!
-# Replace with your method of getting the key
 load_dotenv()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE" # Or paste directly for hackathon testing ONLY
-
-# --- Gemini Configuration & Function ---
+# --- Gemini Configuration & Function (UNCHANGED from previous working version) ---
 gemini_model = None
 if GEMINI_API_KEY:
     try:
-        print("Configuring Gemini...")
-        genai.configure(api_key=GEMINI_API_KEY)
-        print("--- Listing Available Models (supporting generateContent) ---")
-        try:
-            count = 0
-            for m in genai.list_models():
-                # Check if the 'generateContent' method is supported
-                if 'generateContent' in m.supported_generation_methods:
-                    print(f"- {m.name}") # Print the EXACT name
-                    count += 1
-            if count == 0:
-                print("  No models supporting 'generateContent' found for this API key.")
-        except Exception as e:
-            print(f"  Could not list models: {e}")
-        print("--- End Model Listing ---")
-        gemini_model = genai.GenerativeModel('gemini-1.5-pro-latest') # Or 'gemini-1.0-pro' etc.
+        print("Configuring Gemini..."); genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel('models/gemini-1.5-pro-latest')
         print("Gemini Configured.")
-    except Exception as e:
-        print(f"WARNING: Failed to configure Gemini: {e}. Using default simulation parameters.")
-else:
-    print("WARNING: GEMINI_API_KEY not found. Using default simulation parameters.")
+    except Exception as e: print(f"WARNING: Gemini config failed: {e}")
+else: print("WARNING: GEMINI_API_KEY not found.")
 
 def tune_parameters_with_gemini(current_config):
-    if not gemini_model:
-        print("Gemini not available, skipping tuning.")
-        return current_config # Return defaults if Gemini isn't working
-
-    # Select parameters to tune
-    tunable_params = [
-        "FRAUD_INJECTION_PROBABILITY",
-        "PERFORM_TEST_TXN_PROB",
-        "ATTEMPT_NEAR_MISS_VELOCITY_PROB",
-        # Could add amount ranges but parsing tuples/ranges is harder
-    ]
-    current_param_values = {k: current_config[k] for k in tunable_params}
-
-    # Craft the prompt asking for structured output (attempt JSON)
+    # (Function code remains the same - attempts to tune probabilities)
+    if not gemini_model: return current_config
+    tunable_params = ["FRAUD_INJECTION_PROBABILITY", "PERFORM_TEST_TXN_PROB", "ATTEMPT_NEAR_MISS_VELOCITY_PROB", "PROB_NORMAL_IS_FARTHER", "PROB_FRAUD_IS_CLOSER"] # Added new tunable probs
+    current_param_values = {k: current_config[k] for k in tunable_params if k in current_config}
     prompt = f"""
     Analyze the following credit card fraud simulation parameters:
     {json.dumps(current_param_values, indent=2)}
-
-    Suggest *slightly modified* values for these parameters to simulate fraudsters being
-    'more cautious and subtle'. Keep probabilities between 0.01 and 0.5.
-
-    Provide your response ONLY as a valid JSON object containing the suggested
-    values for these specific keys ({', '.join(tunable_params)}).
-    Example Response Format (JUST THE JSON):
-    {{
-      "FRAUD_INJECTION_PROBABILITY": 0.04,
-      "PERFORM_TEST_TXN_PROB": 0.25,
-      "ATTEMPT_NEAR_MISS_VELOCITY_PROB": 0.35
-    }}
-    """
-
-    print("\n--- Attempting to tune parameters with Gemini ---")
-    print(f"Prompt sent to Gemini:\n{prompt}")
-
+    Suggest *slightly modified* values (probabilities between 0.01 and 0.5) to simulate
+    fraudsters being 'moderately sneaky but sometimes making mistakes'.
+    Provide response ONLY as JSON: {{"PARAM1": VALUE1, ...}}""" # Condensed prompt
+    print("\n--- Attempting to tune parameters with Gemini ---"); # print(f"Prompt:\n{prompt}")
     updated_config = current_config.copy()
     try:
-        response = gemini_model.generate_content(prompt)
-        print(f"\nGemini Raw Response Text:\n{response.text}\n")
-
-        # Attempt to parse the response as JSON
-        # Clean potential markdown backticks if Gemini wraps JSON in them
+        response = gemini_model.generate_content(prompt); # print(f"\nGemini Raw:\n{response.text}\n")
         cleaned_response = response.text.strip().strip('```json').strip('```').strip()
-
-        try:
-            suggested_params = json.loads(cleaned_response)
-            print("Successfully parsed JSON response from Gemini.")
-
-            # Update the config dictionary safely
-            for key, value in suggested_params.items():
-                if key in updated_config and isinstance(value, (int, float)): # Basic type check
-                     # Add bounds checks for probabilities
-                     if key.endswith("_PROB"):
-                         if 0.0 <= value <= 1.0:
-                             print(f"Updating {key} from {updated_config[key]} to {value}")
-                             updated_config[key] = float(value)
-                         else:
-                             print(f"WARNING: Gemini suggested invalid probability for {key}: {value}. Keeping default.")
-                     # Add more checks for other types if tuning them (e.g., ranges)
-                else:
-                    print(f"WARNING: Ignoring invalid/unexpected key or value type from Gemini for key '{key}': {value}")
-
-        except json.JSONDecodeError as e:
-            print(f"WARNING: Could not parse Gemini response as JSON: {e}. Using default parameters.")
-            # Fallback: Very basic regex attempt (less reliable)
-            # for key in tunable_params:
-            #    match = re.search(rf'"{key}"\s*:\s*([0-9.]+)', response.text)
-            #    if match:
-            #        try:
-            #            val = float(match.group(1))
-            #            if 0.0 <= val <= 1.0: # Probability check
-            #                 print(f"Updating {key} via REGEX to {val}")
-            #                 updated_config[key] = val
-            #        except ValueError: continue # Ignore if conversion fails
-
-    except Exception as e:
-        print(f"WARNING: Error during Gemini API call: {e}. Using default parameters.")
-
+        suggested_params = json.loads(cleaned_response)
+        print("Parsed Gemini Suggestion:", suggested_params)
+        for key, value in suggested_params.items():
+            if key in updated_config and isinstance(value, (int, float)):
+                if key.endswith("_PROB"):
+                    if 0.0 <= value <= 1.0: print(f"Updating {key} from {updated_config[key]:.2f} to {value:.2f}"); updated_config[key] = float(value)
+                    else: print(f"WARNING: Invalid prob for {key}: {value}")
+                # Add other type handling here if tuning ranges etc.
+            else: print(f"WARNING: Ignoring Gemini suggestion for {key}")
+    except Exception as e: print(f"WARNING: Gemini tuning failed: {e}. Using previous parameters.")
     print("--- Parameter tuning attempt complete ---")
-    return updated_config # Return the potentially updated config
+    return updated_config
 
-# --- Helper Functions (generate_location_around, etc. - UNCHANGED) ---
+# --- Helper Functions (UNCHANGED - generate_location_around, haversine, generate_timestamp, send_to_kinesis) ---
 def generate_location_around(lat, lon, max_distance_km): # (Same as before)
     radius_deg_lat = max_distance_km / 111.1;
     try: radius_deg_lon = max_distance_km / (111.1 * math.cos(math.radians(lat)))
@@ -182,63 +102,64 @@ def send_to_kinesis(data_record, stream_name, partition_key): # (Same as before)
 
 # --- Main Simulation ---
 
-# <<< *** GET TUNED PARAMETERS *** >>>
-config = tune_parameters_with_gemini(config) # Update global config dictionary
+config = tune_parameters_with_gemini(config)
 
-# Use tuned parameters from the 'config' dictionary hereafter
 print("\n--- Starting Simulation with Final Parameters ---")
 for key, value in config.items():
-    # Avoid printing sensitive info like API keys if they were accidentally added
-    if "KEY" not in key.upper() and "SECRET" not in key.upper():
-        print(f"Parameter: {key} = {value}")
+    if "KEY" not in key.upper() and "SECRET" not in key.upper(): print(f"Parameter: {key} = {value}")
 print("---")
 
-
 print("Initializing card data...")
-cards_data = {}
-for i in range(config["NUM_CARDS"]): # Use value from config
-    card_id = f"CARD_{i:04d}"; home_lat = random.uniform(25.0, 65.0); home_lon = random.uniform(-125.0, 40.0)
-    cards_data[card_id] = {"HomeLatitude": round(home_lat, 6),"HomeLongitude": round(home_lon, 6),"IsCompromised": random.random() < config["COMPROMISE_CARD_PROBABILITY"],"LastTxTimestamp": None,"LastTxLatitude": None,"LastTxLongitude": None,}
+cards_data = {} # (Initialization unchanged)
+for i in range(config["NUM_CARDS"]): card_id = f"CARD_{i:04d}"; home_lat = random.uniform(25.0, 65.0); home_lon = random.uniform(-125.0, 40.0); cards_data[card_id] = {"HomeLatitude": round(home_lat, 6),"HomeLongitude": round(home_lon, 6),"IsCompromised": random.random() < config["COMPROMISE_CARD_PROBABILITY"],"LastTxTimestamp": None,"LastTxLatitude": None,"LastTxLongitude": None,}
 print(f"Generated {len(cards_data)} cards.")
 print(f"Starting simulation, writing to '{config['OUTPUT_FILENAME']}'...")
 
-
 current_time = datetime.datetime.now(datetime.timezone.utc)
-transactions_generated = 0
-successful_sends = 0
+transactions_generated = 0; successful_sends = 0
 
 with open(config['OUTPUT_FILENAME'], 'w') as outfile:
     while transactions_generated < config['NUM_TRANSACTIONS']:
-        card_id = random.choice(list(cards_data.keys()))
-        card_info = cards_data[card_id]
+        card_id = random.choice(list(cards_data.keys())); card_info = cards_data[card_id]
+        is_fraud_scenario = card_info["IsCompromised"] and random.random() < config["FRAUD_INJECTION_PROBABILITY"]
 
-        is_fraud_scenario = False
-        if card_info["IsCompromised"] and random.random() < config["FRAUD_INJECTION_PROBABILITY"]: # Use config value
-             is_fraud_scenario = True
+        amount = 0.0; merchant_lat, merchant_lon = 0.0, 0.0; is_fraud_flag_for_output = False
 
-        # --- Simulate Transaction ---
-        # (Fraud logic now uses probabilities/ranges from the 'config' dictionary)
-        amount = 0.0
-        merchant_lat, merchant_lon = 0.0, 0.0
-        is_fraud_flag_for_output = False
-
+        # -- FRAUD SCENARIO --
         if is_fraud_scenario:
-            if random.random() < config["PERFORM_TEST_TXN_PROB"]: # Use config value
+            is_fraud_flag_for_output = True
+            # Tactic 1: Small "Test" Transaction
+            if random.random() < config["PERFORM_TEST_TXN_PROB"]:
                 print(f"[Fraud Tactic] Simulating TEST transaction for {card_id}")
-                is_fraud_flag_for_output = True
-                amount = round(random.uniform(*config["FRAUD_TEST_AMOUNT_RANGE"]), 2) # Use config value
-                test_distance_km = random.uniform(config["DISTANCE_THRESHOLD_KM"] * 0.8, config["LOCATION_VARIATION_KM_FRAUD"] * 0.75)
+                amount = round(random.uniform(*config["FRAUD_TEST_AMOUNT_RANGE"]), 2)
+                test_distance_km = random.uniform(config["DISTANCE_THRESHOLD_KM"] * 0.8, config["LOCATION_VARIATION_KM_FRAUD_MAX"] * 0.6) # Still quite far for test
                 merchant_lat, merchant_lon = generate_location_around(card_info["HomeLatitude"], card_info["HomeLongitude"], test_distance_km)
                 time_increment = random.expovariate(1.0 / (config["AVG_TRANSACTION_DELAY_SECONDS"] * 1.5))
                 current_time = generate_timestamp(current_time, time_increment)
+
+            # Tactic 2: Main Fraud Attempt (potentially closer or near-miss velocity)
             else:
                 print(f"[Fraud Tactic] Simulating MAIN fraud attempt for {card_id}")
-                is_fraud_flag_for_output = True
-                amount = round(random.uniform(*config["FRAUD_MAIN_AMOUNT_RANGE"]), 2) # Use config value
-                fraud_distance_km = random.uniform(config["DISTANCE_THRESHOLD_KM"], config["LOCATION_VARIATION_KM_FRAUD"])
-                merchant_lat, merchant_lon = generate_location_around(card_info["HomeLatitude"], card_info["HomeLongitude"], fraud_distance_km)
+                amount = round(random.uniform(*config["FRAUD_MAIN_AMOUNT_RANGE"]), 2) # Overlaps normal
 
-                if card_info["LastTxTimestamp"] and card_info["LastTxLatitude"] is not None and random.random() < config["ATTEMPT_NEAR_MISS_VELOCITY_PROB"]: # Use config value
+                # --- MODIFIED: Location logic for main fraud ---
+                if random.random() < config["PROB_FRAUD_IS_CLOSER"]:
+                     print("[Fraud Tactic Adjust] Simulating CLOSER main fraud.")
+                     # Generate closer to home, in the harder-to-detect zone near the normal boundary
+                     fraud_distance_km = random.uniform(
+                         config["LOCATION_VARIATION_KM_NORMAL_BASE"] * 1.5, # Above normal base
+                         config["DISTANCE_THRESHOLD_KM"] * 1.1               # But near/just over the threshold
+                     )
+                else: # Default: Far away main fraud
+                    fraud_distance_km = random.uniform(
+                        config["DISTANCE_THRESHOLD_KM"], config["LOCATION_VARIATION_KM_FRAUD_MAX"]
+                    )
+                merchant_lat, merchant_lon = generate_location_around(card_info["HomeLatitude"], card_info["HomeLongitude"], fraud_distance_km)
+                # --- End Modified Location ---
+
+                # Near-Miss Velocity Logic (remains mostly the same, applies to chosen location)
+                if card_info["LastTxTimestamp"] and card_info["LastTxLatitude"] is not None and random.random() < config["ATTEMPT_NEAR_MISS_VELOCITY_PROB"]:
+                    # ... (near-miss velocity time calculation same as before) ...
                     last_ts, last_lat, last_lon = card_info["LastTxTimestamp"], card_info["LastTxLatitude"], card_info["LastTxLongitude"]
                     distance_km = haversine(last_lat, last_lon, merchant_lat, merchant_lon)
                     target_velocity_kmh = config["VELOCITY_THRESHOLD_KMH"] * random.uniform(0.85, 0.99)
@@ -247,19 +168,30 @@ with open(config['OUTPUT_FILENAME'], 'w') as outfile:
                         simulated_delay_seconds = max(10.0, required_time_seconds * random.uniform(1.0, 1.15))
                         print(f"[Fraud Tactic] Attempting Near Miss Velocity ({target_velocity_kmh:.0f} km/h -> delay {simulated_delay_seconds:.0f}s) for {card_id}")
                         current_time = last_ts + datetime.timedelta(seconds=simulated_delay_seconds)
-                    else:
-                        time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"])
-                        current_time = generate_timestamp(current_time, time_increment)
-                else:
-                    time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"])
-                    current_time = generate_timestamp(current_time, time_increment)
-        else: # Normal Transaction
+                    else: time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"]); current_time = generate_timestamp(current_time, time_increment)
+                else: # Standard time increment for main fraud
+                    time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"]); current_time = generate_timestamp(current_time, time_increment)
+
+        # -- NORMAL TRANSACTION SCENARIO --
+        else:
             is_fraud_flag_for_output = False
-            amount = round(random.uniform(*config["NORMAL_AMOUNT_RANGE"]), 2) # Use config value
-            normal_distance_km = random.uniform(0, config["LOCATION_VARIATION_KM_NORMAL"]) # Use config value
+            amount = round(random.uniform(*config["NORMAL_AMOUNT_RANGE"]), 2) # Normal range overlaps fraud
+
+            # --- MODIFIED: Location logic for normal transaction ---
+            if random.random() < config["PROB_NORMAL_IS_FARTHER"]:
+                 print("[Normal Tactic Adjust] Simulating FURTHER normal transaction.")
+                 # Generate farther, potentially into the "closer fraud" zone
+                 normal_distance_km = random.uniform(
+                     config["LOCATION_VARIATION_KM_NORMAL_BASE"], # Start from base normal
+                     config["LOCATION_VARIATION_KM_NORMAL_FARTHER"] # Go up to the farther limit
+                 )
+            else: # Default: Close normal
+                normal_distance_km = random.uniform(0, config["LOCATION_VARIATION_KM_NORMAL_BASE"]) # Stay within base
             merchant_lat, merchant_lon = generate_location_around(card_info["HomeLatitude"], card_info["HomeLongitude"], normal_distance_km)
-            time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"]) # Use config value
-            current_time = generate_timestamp(current_time, time_increment)
+             # --- End Modified Location ---
+
+            # Normal time progression
+            time_increment = random.expovariate(1.0 / config["AVG_TRANSACTION_DELAY_SECONDS"]); current_time = generate_timestamp(current_time, time_increment)
 
         # --- Create Transaction Record (unchanged) ---
         transaction_id = str(uuid.uuid4()); merchant_id = f"MERCHANT_{random.randint(1000, 9999)}"
@@ -269,15 +201,15 @@ with open(config['OUTPUT_FILENAME'], 'w') as outfile:
             "IsFraud": is_fraud_flag_for_output, "HomeLatitude": card_info["HomeLatitude"], "HomeLongitude": card_info["HomeLongitude"]
         }
 
-        # --- Output / State Update (unchanged logic, uses updated current_time etc)---
+        # --- Output / State Update (unchanged logic) ---
         json_output = json.dumps(transaction_data); outfile.write(json_output + '\n'); transactions_generated += 1
-        if transactions_generated % 100 == 0: print(f"... generated {transactions_generated}/{config['NUM_TRANSACTIONS']} transactions")
+        if transactions_generated % 500 == 0: print(f"... generated {transactions_generated}/{config['NUM_TRANSACTIONS']} transactions") # Log less often for large runs
         if config['SEND_TO_KINESIS']:
             if send_to_kinesis(transaction_data, config['KINESIS_STREAM_NAME'], card_id): successful_sends += 1
             else: config['SEND_TO_KINESIS'] = False # Stop trying
         card_info["LastTxTimestamp"] = current_time; card_info["LastTxLatitude"] = merchant_lat; card_info["LastTxLongitude"] = merchant_lon
 
 # --- End of Simulation ---
-print(f"\nFinished generating {transactions_generated} auto-tuned transactions.")
+print(f"\nFinished generating {transactions_generated} MORE DIFFICULT auto-tuned transactions.")
 print(f"Data saved to '{config['OUTPUT_FILENAME']}'")
 if successful_sends > 0: print(f"Sent {successful_sends} records to Kinesis stream '{config['KINESIS_STREAM_NAME']}'.")
