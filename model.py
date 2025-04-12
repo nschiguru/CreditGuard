@@ -1,99 +1,176 @@
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, RobustScaler # RobustScaler less sensitive to outliers
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve, auc
-# For SMOTE (if chosen for imbalance):
-# from imblearn.over_sampling import SMOTE
-# from imblearn.pipeline import Pipeline # Helpful for combining steps
+import numpy as np
+from sklearn.model_selection import train_test_split
+# from sklearn.utils import class_weight # Not directly used in XGBoost in the same way
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
+                             precision_recall_curve, auc, f1_score, precision_score, recall_score)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb # Import XGBoost
+import sys
+import joblib # To save the model
 
-# --- 1. Load Data ---
+print("--- Phase 2: XGBoost Fraud Detection Model Training on Synthetic Data ---")
+
+# --- Configuration ---
+TRAINING_DATA_FILE = 'training_data_unscaled.csv' # Input from Phase 1
+MODEL_SAVE_FILE = 'creditguard_xgb.joblib' # Output XGBoost model file
+TEST_SET_SIZE = 0.2
+RANDOM_STATE = 42
+
+# --- 1. Load Processed Data ---
 try:
-    data = pd.read_csv('creditcard.csv') # Make sure this file is downloaded and accessible
-    print("Data loaded successfully.")
-    print(data.head())
+    data = pd.read_csv(TRAINING_DATA_FILE)
+    print(f"Loaded processed data from '{TRAINING_DATA_FILE}'. Shape: {data.shape}")
+    if data.empty: sys.exit("Error: Loaded data is empty. Exiting.")
 except FileNotFoundError:
-    print("Error: creditcard.csv not found. Please download it.")
-    exit()
+    print(f"ERROR: Training data file '{TRAINING_DATA_FILE}' not found.")
+    sys.exit("Please run the preprocessing script first.")
+except Exception as e:
+    print(f"Error loading data: {e}"); sys.exit(1)
 
-# --- 2. Preprocessing ---
-print("Preprocessing data...")
+# --- 2. Define Features (X) and Target (y) ---
+target_col = data.columns[-1]
+if target_col.lower() != 'isfraud':
+    print(f"Warning: Assuming last column '{target_col}' is the target.")
 
-# Drop 'Time' if not using it for sequence (often not useful in this static form)
-# data = data.drop('Time', axis=1)
+X = data.drop(target_col, axis=1)
+y = data[target_col]
+if not np.issubdtype(y.dtype, np.integer): y = y.astype(int)
 
-# Scale 'Amount' and 'Time' (if kept)
-# scaler = StandardScaler()
-scaler = RobustScaler() # Often better for data with potential outliers like Amount
-
-# Scale 'Amount' - Create a copy first to avoid SettingWithCopyWarning
-data_scaled = data.copy()
-data_scaled['scaled_Amount'] = scaler.fit_transform(data_scaled['Amount'].values.reshape(-1, 1))
-# data_scaled['scaled_Time'] = scaler.fit_transform(data_scaled['Time'].values.reshape(-1, 1)) # if keeping Time
-
-# Drop original columns
-data_scaled = data_scaled.drop(['Amount', 'Time'], axis=1, errors='ignore') # Ignore error if Time was already dropped
-
-# Define Features (X) and Target (y)
-X = data_scaled.drop('Class', axis=1)
-y = data_scaled['Class']
+print(f"\nFeatures shape: {X.shape}"); print(f"Target shape: {y.shape}")
+print("Input features:", X.columns.tolist())
+print(f"Class distribution in loaded data:\n{y.value_counts(normalize=True)}")
 
 # --- 3. Train/Test Split (Stratified) ---
+print("\n--- Splitting Data ---")
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
+    X, y, test_size=TEST_SET_SIZE, random_state=RANDOM_STATE, stratify=y
 )
-
-print(f"Training set shape: {X_train.shape}")
-print(f"Testing set shape: {X_test.shape}")
+print(f"Training set shape: {X_train.shape}, Target: {y_train.shape}")
+print(f"Testing set shape: {X_test.shape}, Target: {y_test.shape}")
 print(f"Fraud cases in training set: {sum(y_train)}")
 print(f"Fraud cases in testing set: {sum(y_test)}")
 
+# --- 4. Handling Imbalance - Calculate 'scale_pos_weight' for XGBoost ---
+# XGBoost uses a specific parameter `scale_pos_weight` for imbalance.
+# It's typically calculated as: count(negative_class) / count(positive_class)
+print("\n--- Calculating scale_pos_weight for XGBoost ---")
+neg_count, pos_count = np.bincount(y_train)
+if pos_count == 0:
+    print("ERROR: No positive samples (fraud) in the training set!")
+    scale_pos_weight_value = 1 # Default if no positive samples
+else:
+    scale_pos_weight_value = neg_count / pos_count
+print(f'Training samples: Total={neg_count+pos_count}, Non-Fraud={neg_count}, Fraud={pos_count}')
+print(f'Calculated scale_pos_weight: {scale_pos_weight_value:.2f}')
+print("(XGBoost will give fraud cases this much more weight)")
 
-# --- 4. Handle Imbalance (Example: using class_weight) ---
-# Option A: Using class_weight parameter (simple for some models)
-# model = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42)
-model = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42, n_jobs=-1) # Use balanced RF
+# --- 5. Define and Train XGBoost Model ---
 
-# Option B: Using SMOTE (Requires imblearn)
-# print("Applying SMOTE...")
-# smote = SMOTE(random_state=42)
-# X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
-# print(f"Resampled training set shape: {X_train_resampled.shape}")
-# print(f"Resampled fraud cases: {sum(y_train_resampled)}")
-# model = LogisticRegression(solver='liblinear', random_state=42) # Train on resampled data
-# model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1) # Train on resampled data
+# Initialize XGBoost Classifier
+# Common parameters:
+# n_estimators: number of boosting rounds (trees)
+# max_depth: max depth of each tree
+# learning_rate: step size shrinkage
+# objective: 'binary:logistic' for binary classification (outputs probability)
+# scale_pos_weight: handles imbalance
+# use_label_encoder=False: recommended nowadays
+# eval_metric: metric for early stopping (e.g., 'aucpr' for Area Under PR Curve)
+# early_stopping_rounds: stops training if eval metric doesn't improve
+print("\n--- Defining and Training XGBoost Model ---")
 
-# --- 5. Train Model ---
-print(f"Training {model.__class__.__name__}...")
-# If using SMOTE, train on resampled data:
-# model.fit(X_train_resampled, y_train_resampled)
-# If using class_weight, train on original stratified data:
-model.fit(X_train, y_train)
+# Initialize XGBoost Classifier WITH early stopping parameter
+xgb_model = xgb.XGBClassifier(
+    objective='binary:logistic',
+    eval_metric='aucpr',          # Evaluate using Area Under PR Curve
+    scale_pos_weight=scale_pos_weight_value, # Handle imbalance
+    use_label_encoder=False,    # Recommended setting
+    n_estimators=200,           # Start with a reasonable number of trees
+    learning_rate=0.1,          # Common learning rate
+    max_depth=5,                # Controls tree complexity
+    subsample=0.8,              # Fraction of samples used per tree
+    colsample_bytree=0.8,       # Fraction of features used per tree
+    gamma=0,                    # Minimum loss reduction for split (regularization)
+    early_stopping_rounds=20,   # <<< MOVED HERE! Stop if AUC-PR on test set doesn't improve
+    random_state=RANDOM_STATE,
+    n_jobs=-1                   # Use all available CPU cores
+)
+
+# XGBoost still needs an evaluation set to PERFORM the early stopping
+eval_set = [(X_test, y_test)] # Evaluate directly on the test set during training
+
+print("Training...")
+# Fit the model, passing only the necessary arguments
+xgb_model.fit(
+    X_train,
+    y_train,
+    eval_set=eval_set,
+    verbose=False             # Set to True or a number to see progress
+)
 print("Training complete.")
+if hasattr(xgb_model, 'best_iteration'): # Check if early stopping occurred
+    print(f"Best iteration (tree): {xgb_model.best_iteration}")
+else:
+    print("Early stopping did not occur (trained for full n_estimators).")
+print(f"Best iteration (tree): {xgb_model.best_iteration}") # Check where it stopped
 
-# --- 6. Evaluate Model ---
-print("Evaluating model on the test set...")
-y_pred = model.predict(X_test)
-y_pred_proba = model.predict_proba(X_test)[:, 1] # Probability of class 1 (fraud)
+# --- 6. Evaluate the Model on the TEST Set ---
+print("\n--- Evaluating Model on Test Set ---")
+y_pred_proba_test = xgb_model.predict_proba(X_test)[:, 1] # Probability of class 1
+y_pred_class_test = xgb_model.predict(X_test)          # Class prediction (uses 0.5 threshold by default)
 
-print("\nConfusion Matrix:")
-print(confusion_matrix(y_test, y_pred))
+print("\nConfusion Matrix (Test Set):")
+print(confusion_matrix(y_test, y_pred_class_test))
 
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred, target_names=['Non-Fraud', 'Fraud']))
+print("\nClassification Report (Test Set):")
+print(classification_report(y_test, y_pred_class_test, target_names=['Non-Fraud (0)', 'Fraud (1)']))
 
-print(f"\nArea Under ROC Curve (AUC-ROC): {roc_auc_score(y_test, y_pred_proba):.4f}")
+# Calculate key metrics explicitly
+precision = precision_score(y_test, y_pred_class_test)
+recall = recall_score(y_test, y_pred_class_test)
+f1 = f1_score(y_test, y_pred_class_test)
+auc_roc = roc_auc_score(y_test, y_pred_proba_test)
+pr_precision, pr_recall, _ = precision_recall_curve(y_test, y_pred_proba_test)
+auc_pr = auc(pr_recall, pr_precision)
 
-# Calculate Precision-Recall Curve and AUC-PR
-precision, recall, _ = precision_recall_curve(y_test, y_pred_proba)
-auc_pr = auc(recall, precision)
-print(f"Area Under Precision-Recall Curve (AUC-PR): {auc_pr:.4f}")
+print("\nKey Test Set Metrics:")
+print(f"Precision: {precision:.4f}")
+print(f"Recall:    {recall:.4f}")
+print(f"F1-Score:  {f1:.4f}")
+print(f"AUC-ROC:   {auc_roc:.4f}")
+print(f"AUC-PR:    {auc_pr:.4f}")
+
+# --- 7. Feature Importance (Optional but insightful) ---
+print("\n--- Feature Importance ---")
+try:
+    importance = xgb_model.get_booster().get_score(importance_type='weight') # or 'gain' or 'cover'
+    feature_importance = pd.DataFrame({
+        'Feature': list(importance.keys()),
+        'Importance': list(importance.values())
+    }).sort_values('Importance', ascending=False)
+
+    print(feature_importance)
+
+    # Plot feature importance
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x='Importance', y='Feature', data=feature_importance.head(10)) # Plot top 10
+    plt.title('XGBoost Feature Importance (Weight)')
+    plt.tight_layout()
+    plt.show()
+except Exception as e:
+    print(f"Could not generate feature importance plot: {e}")
 
 
-# --- Next Steps ---
-# - Save the trained model (e.g., using joblib or pickle)
-# - Hyperparameter tuning (GridSearchCV, RandomizedSearchCV)
-# - Try different models (XGBoost, LightGBM, Neural Networks)
-# - If using AWS, deploy the saved model to a SageMaker Endpoint
-# - Modify the Lambda function to call the SageMaker Endpoint
+# --- 8. Save the Trained Model ---
+print(f"\n--- Saving Trained XGBoost Model to {MODEL_SAVE_FILE} ---")
+try:
+    joblib.dump(xgb_model, MODEL_SAVE_FILE)
+    print("Model saved successfully using joblib.")
+    # Alternatively, XGBoost has its own save method:
+    # xgb_model.save_model(MODEL_SAVE_FILE.replace('.joblib', '.xgb'))
+    # print("Model saved successfully using XGBoost format.")
+except Exception as e:
+    print(f"ERROR: Could not save model: {e}")
+
+print("\n--- Phase 2 Model Training Finished ---")
