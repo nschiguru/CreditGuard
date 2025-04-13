@@ -1,20 +1,20 @@
-Inspiration
+Inspiration:
 The driving force behind CreditGuard stems from the growing threat of credit card fraud. The financial losses and decline in customer trust necessitate constant improvement in detection systems to effectively keep pace with evolving fraud. We recognized a critical facet to make our detection different: the difficulty in obtaining large, diverse, and realistic training data that reflects the complex strategies employed by fraudsters. So, this project was inspired by the challenge of creating a dynamic data generation process to empower the development of a highly accurate fraud detection model.
 
-What it does
+What it does:
 CreditGuard performs credit card transaction simulation, generating patterns including overlapping amount and location ranges and near-miss velocity tactics designed to evade simple detection rules. It leverages the Google Gemini API to dynamically tune simulation parameters, like fraud injection probabilities. This enhances the realism and difficulty of the generated dataset. Following this, it trains a XGBoost machine learning model. The model's hyperparameters are optimized using a fine-tuning process by the workflow of AWS SageMaker's Automatic Model Tuning, aiming to maximize a precision metrics on a validation set. To keep with out intention of a highly accurate fraud detection model, we achieve over 90% precision in identifying fraudulent transactions on testing data.
 
-How we built it
+How we built it:
 The simulation was built in Python, using standard libraries like pandas and numpy to generate realistic cardholder data, timestamps, locations with Haversine calculations, and transaction amounts. Specific logic was implemented within this simulation to mirror complex fraud tactics, including low-value tests, velocity checks, and slight overlaps between real and fraudulent activity patterns. We integrated the Google Gemini API to dynamically adjust simulation probabilities. Then parsing its JSON suggestions, we saw AI-driven variability that mimics sophisticated fraud behaviors. For the model, we used an XGBoost algorithm that handles structured, imbalanced data. We mimicked AWS SageMaker's Automatic Model Tuning locally to optimize XGBoost's hyperparameters based on a centrism around precision and optimal classification threshold. The generated transaction data integrated boto3 to demonstrate real-time connectivity through AWS Kinesis.
 
-Challenges we ran into
+Challenges we ran into:
 Crafting synthetic data proved challenging, particularly in generating smaller overlaps between real and fraudulent transactions that mimic evasion techniques. Furthermore, reliably extracting meaningful tuning parameters from the Gemini API required prompt engineering and response parsing to disregard invalid responses. There was a lot of challenge in achieving over 90% precision without compromising recall, a common trade-off in fraud detection. So, reaching this threshold necessitated iterative tuning of the model's hyperparameters and the final classification probability cutoff. Also, simulating the SageMaker AMT workflow locally presented some difficulties as we had to learn how to implement the local equivalent using scikit-learn. Overcoming these challenges was constant, but allowed constant improvement as well in both data simulation and model optimization stages.
 
-Accomplishments that we're proud of
+Accomplishments that we're proud of:
 We are proud of constructing a functional end-to-end conceptual pipeline, starting from data simulation, progressing through AI-assisted parameter refinement, implementing a model training and tuning, and ending in targeted threshold optimization to meet performance benchmarks. Integrating the Google Gemini API represented a significant achievement, moving beyond simple simulation to dynamically data generation which added a unique realism.
 
-What we learned
+What we learned:
 This project provided insights into the nuances of realistic fraud simulation and creating challenging synthetic data requires carefully balancing numerous parameters to avoid detection while still embedding fraudulent signals.
 
-What's next for CreditGuard
+What's next for CreditGuard:
 The next step is to validate the trained XGBoost model's performance on real-world, unseen transaction data. Also, we aim to deploy the model via a scalable AWS SageMaker real-time inference endpoint to transition CreditGuard from a simulated concept to a production-ready fraud detection service.
