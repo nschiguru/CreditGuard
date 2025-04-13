@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
 from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
                              precision_recall_curve, auc, f1_score, precision_score, recall_score,
-                             fbeta_score, make_scorer) # Import tools
+                             fbeta_score, make_scorer)
 import matplotlib.pyplot as plt
 import seaborn as sns
 import xgboost as xgb
@@ -12,7 +12,7 @@ import joblib
 import time
 import json
 import os
-from scipy.stats import uniform, randint # For RandomizedSearchCV ranges
+from scipy.stats import uniform, randint
 
 print("--- Local XGBoost Tuning with RandomizedSearchCV & Threshold Optimization ---")
 print("--- Goal: Achieve >= 90% Precision on Test Set ---")
@@ -23,20 +23,13 @@ BEST_MODEL_SAVE_FILE = 'creditguard_xgb_best_randomsearch.joblib'
 THRESHOLD_SAVE_FILE = 'optimal_threshold_randomsearch.json'
 FINAL_EVALUATION_FILE = 'final_evaluation_randomsearch.json'
 
-TARGET_PRECISION = 0.90 # Keep target at 90% for the final threshold step
+TARGET_PRECISION = 0.90
 RANDOM_STATE = 42
 
-# Data Split Ratios
 TEST_SET_SIZE = 0.20
-# Validation data will be handled by Cross-Validation within RandomizedSearchCV
+N_ITER_SEARCH = 30
+CV_FOLDS = 3
 
-# RandomizedSearch Config
-N_ITER_SEARCH = 30 # Number of parameter settings sampled (Increase for more thorough search)
-CV_FOLDS = 3       # Number of cross-validation folds (Use at least 3, maybe 5)
-
-# --- Helper Functions (log_metrics, find_optimal_threshold - Keep from previous script) ---
-# [Include the exact log_metrics and find_optimal_threshold functions from the previous response here]
-# --- Helper Function for Metrics ---
 def log_metrics(y_true, y_pred_proba, y_pred_class, prefix="test", threshold=0.5):
     """Calculates, prints, and returns metrics for logging."""
     metrics_dict = {}
@@ -109,12 +102,10 @@ def find_optimal_threshold(model, X_val, y_val, target_precision):
     optimal_threshold = 0.5 # Default fallback
     found_threshold = False
 
-    # Iterate thresholds (associated with recall/precision pairs) to find first meeting criteria
-    # precision_val[i] corresponds to thresholds_val[i]
+
     valid_indices = [i for i, p in enumerate(precision_val) if p >= target_precision and i < len(thresholds_val)]
 
     if valid_indices:
-        # Choose the index that gives the highest recall among those meeting the precision target
         best_val_idx_for_prec = -1
         max_recall_at_prec = -1
         for i in valid_indices:
@@ -139,10 +130,6 @@ def find_optimal_threshold(model, X_val, y_val, target_precision):
         print(f"WARN: Could not meet target precision {target_precision:.2f} on validation set.")
         print(f"      Highest achieved precision: {precision_val[max_prec_idx]:.4f} at threshold {optimal_threshold:.4f}.")
         print(f"      Using threshold {optimal_threshold:.4f} which yields the max validation precision.")
-        # Or uncomment below to fallback to 0.5 instead
-        # print(f"      Falling back to default threshold 0.5")
-        # optimal_threshold = 0.5
-
     return optimal_threshold
 
 
@@ -155,8 +142,6 @@ try:
 except Exception as e:
     print(f"ERROR loading data: {e}"); sys.exit(1)
 
-# --- 2. Define Features/Target & Split Train+CV / Test ---
-# We only need Train/Test split here; CV handles validation internally
 target_col = data.columns[-1]
 X_full = data.drop(target_col, axis=1)
 y_full = data[target_col].astype(int)
@@ -190,21 +175,17 @@ xgb_clf = xgb.XGBClassifier(
 # Hyperparameter distribution for RandomizedSearchCV
 param_dist = {
     'n_estimators': randint(100, 500),
-    'learning_rate': uniform(0.01, 0.29), # Upper bound is loc + scale = 0.01 + 0.29 = 0.3
-    'max_depth': randint(3, 9), # Tries depths 3 through 8
-    'subsample': uniform(0.6, 0.35), # Range 0.6 to 0.95
-    'colsample_bytree': uniform(0.6, 0.35), # Range 0.6 to 0.95
+    'learning_rate': uniform(0.01, 0.29),
+    'max_depth': randint(3, 9),
+    'subsample': uniform(0.6, 0.35),
+    'colsample_bytree': uniform(0.6, 0.35),
     'gamma': uniform(0.0, 0.5),
-    'reg_alpha': uniform(0.0, 0.5), # L1 regularization
-    'reg_lambda': uniform(0.5, 1.5) # L2 regularization (Range 0.5 to 2.0)
+    'reg_alpha': uniform(0.0, 0.5),
+    'reg_lambda': uniform(0.5, 1.5)
 }
 
-# --- 5. Define Scoring Metric for Tuning ---
-# We want to maximize F0.5 score during hyperparameter search
 f05_scorer = make_scorer(fbeta_score, beta=0.5)
 
-# --- 6. Setup Cross-Validation and Randomized Search ---
-# Use Stratified K-Folds for imbalanced data
 cv_strategy = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
 
 print(f"\n--- Starting Randomized Search (Iterations={N_ITER_SEARCH}, CV Folds={CV_FOLDS}) ---")
@@ -220,21 +201,8 @@ random_search = RandomizedSearchCV(
     n_jobs=-1, # Use all available cores for CV folds if possible
     verbose=2, # Show progress
     random_state=RANDOM_STATE,
-    refit=True # Automatically refit the best model on the whole Train+CV data
+    refit=True 
 )
-
-# Define fit parameters for early stopping within RandomizedSearchCV
-# Need a separate validation split *within* the CV loop for early stopping
-# This is tricky with RandomizedSearchCV directly. A simpler approach for now
-# is to not use early stopping *within* the RandomSearch CV, and rely on n_estimators.
-# Or, provide X_test/y_test just for the *final* refit's early stopping (not ideal).
-# Let's omit early stopping *within* RandomizedSearch for simplicity here,
-# relying on the CV process and n_estimators range.
-# Note: If N_ESTIMATORS is large, this can be slow.
-
-# Fit the Randomized Search
-# Fitting on the Train+CV data. CV splits handle validation internally for scoring.
-random_search.fit(X_train_cv, y_train_cv)
 
 
 total_time = time.time() - start_time
@@ -254,12 +222,6 @@ best_model = random_search.best_estimator_
 # --- 8. Post-Tuning: Threshold Adjustment and Final Evaluation ---
 final_results = {}
 if best_model:
-    # --- Find Optimal Threshold on the *entire* Train+CV Set ---
-    # Since the best model was refit on all Train+CV data, we use that same data
-    # to find the threshold. This assumes the CV process gave us a robust model.
-    # Alternatively, could split off a dedicated validation set *before* CV,
-    # but that reduces training data further. Using the full Train+CV set for
-    # thresholding after refit is a common practice.
     optimal_threshold = find_optimal_threshold(best_model, X_train_cv, y_train_cv, TARGET_PRECISION)
 
     # --- Evaluate the BEST Model on the Held-Out TEST Set using Optimal Threshold ---
@@ -290,7 +252,6 @@ if best_model:
 
     try:
         with open(FINAL_EVALUATION_FILE, 'w') as f:
-             # Convert numpy types for JSON serialization if necessary
             serializable_results = json.loads(json.dumps(final_results, default=lambda x: int(x) if isinstance(x, (np.int64, np.int32)) else None))
             json.dump(serializable_results, f, indent=4)
         print(f"Final evaluation metrics saved to: {FINAL_EVALUATION_FILE}")
