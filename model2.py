@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
 from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
                              precision_recall_curve, auc, f1_score, precision_score, recall_score,
-                             fbeta_score) # Import fbeta_score
+                             fbeta_score, make_scorer) # Import tools
 import matplotlib.pyplot as plt
 import seaborn as sns
 import xgboost as xgb
@@ -12,23 +12,30 @@ import joblib
 import time
 import json
 import os
+from scipy.stats import uniform, randint # For RandomizedSearchCV ranges
 
-print("--- Local XGBoost Hyperparameter Tuning (Simulating SageMaker) ---")
-print("--- Goal: Achieve >= 90% Precision on Test Set via Threshold Tuning ---")
+print("--- Local XGBoost Tuning with RandomizedSearchCV & Threshold Optimization ---")
+print("--- Goal: Achieve >= 90% Precision on Test Set ---")
 
 # --- Configuration ---
 TRAINING_DATA_FILE = 'training_data_unscaled.csv'
-BEST_MODEL_SAVE_FILE = 'creditguard_xgb_best_local_tuned.joblib'
-THRESHOLD_SAVE_FILE = 'optimal_threshold_local.json' # Save the threshold too
-FINAL_EVALUATION_FILE = 'final_evaluation_local.json'
+BEST_MODEL_SAVE_FILE = 'creditguard_xgb_best_randomsearch.joblib'
+THRESHOLD_SAVE_FILE = 'optimal_threshold_randomsearch.json'
+FINAL_EVALUATION_FILE = 'final_evaluation_randomsearch.json'
 
-TARGET_PRECISION = 0.90 # <<< YOUR PRECISION TARGET
+TARGET_PRECISION = 0.90 # Keep target at 90% for the final threshold step
 RANDOM_STATE = 42
 
 # Data Split Ratios
-TEST_SET_SIZE = 0.20       # Reserve 20% for final unbiased test
-VALIDATION_SET_SIZE = 0.25 # Use 25% OF THE REMAINING for validation/thresholding (i.e., 0.25 * 0.80 = 20% of total)
+TEST_SET_SIZE = 0.20
+# Validation data will be handled by Cross-Validation within RandomizedSearchCV
 
+# RandomizedSearch Config
+N_ITER_SEARCH = 30 # Number of parameter settings sampled (Increase for more thorough search)
+CV_FOLDS = 3       # Number of cross-validation folds (Use at least 3, maybe 5)
+
+# --- Helper Functions (log_metrics, find_optimal_threshold - Keep from previous script) ---
+# [Include the exact log_metrics and find_optimal_threshold functions from the previous response here]
 # --- Helper Function for Metrics ---
 def log_metrics(y_true, y_pred_proba, y_pred_class, prefix="test", threshold=0.5):
     """Calculates, prints, and returns metrics for logging."""
@@ -138,6 +145,7 @@ def find_optimal_threshold(model, X_val, y_val, target_precision):
 
     return optimal_threshold
 
+
 # --- 1. Load Data ---
 print(f"\nLoading data from: {TRAINING_DATA_FILE}")
 try:
@@ -147,142 +155,112 @@ try:
 except Exception as e:
     print(f"ERROR loading data: {e}"); sys.exit(1)
 
-# --- 2. Define Features/Target & Initial Split (Train+Val / Test) ---
+# --- 2. Define Features/Target & Split Train+CV / Test ---
+# We only need Train/Test split here; CV handles validation internally
 target_col = data.columns[-1]
-if target_col.lower() != 'isfraud':
-    print(f"Warning: Assuming last column '{target_col}' is the target.")
 X_full = data.drop(target_col, axis=1)
 y_full = data[target_col].astype(int)
-print(f"Full data class distribution:\n{y_full.value_counts(normalize=True)}")
 
-# Split off final test set FIRST
 print(f"\nSplitting off Test set ({TEST_SET_SIZE*100:.0f}%)...")
-X_train_val, X_test, y_train_val, y_test = train_test_split(
+X_train_cv, X_test, y_train_cv, y_test = train_test_split(
     X_full, y_full, test_size=TEST_SET_SIZE, random_state=RANDOM_STATE, stratify=y_full
 )
+print(f"Train/CV set shape: {X_train_cv.shape} (Fraud cases: {sum(y_train_cv)})")
+print(f"Test set shape:     {X_test.shape} (Fraud cases: {sum(y_test)})")
 
-# Split remaining data into Train and Validation
-print(f"Splitting remaining into Train/Validation ({VALIDATION_SET_SIZE*100:.0f}% of rest)...")
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train_val, y_train_val, test_size=VALIDATION_SET_SIZE, random_state=RANDOM_STATE, stratify=y_train_val
-)
-print(f"\nData Split Shapes:")
-print(f"  Training set:   {X_train.shape} (Fraud cases: {sum(y_train)})")
-print(f"  Validation set: {X_val.shape} (Fraud cases: {sum(y_val)})")
-print(f"  Test set:       {X_test.shape} (Fraud cases: {sum(y_test)})")
-
-# --- 3. Calculate scale_pos_weight (on Train set ONLY) ---
+# --- 3. Calculate scale_pos_weight (on the full Train+CV set) ---
 print("\nCalculating scale_pos_weight on training data...")
-neg_count, pos_count = np.bincount(y_train)
-if pos_count == 0:
-    print("ERROR: No positive samples in the final training set!")
-    scale_pos_weight_value = 1
-else:
-    scale_pos_weight_value = neg_count / pos_count
+neg_count, pos_count = np.bincount(y_train_cv)
+scale_pos_weight_value = neg_count / pos_count if pos_count > 0 else 1
 print(f'Calculated scale_pos_weight: {scale_pos_weight_value:.2f}')
 
-# --- 4. Define Hyperparameter Sets to Try ---
-# Add more diverse sets to explore the space better
-# Focus parameters that might influence precision/recall trade-off (e.g., regularization, depth)
-hyperparameter_sets = [
-    { 'n_estimators': 150, 'learning_rate': 0.1, 'max_depth': 4, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'early_stopping_rounds': 20},
-    { 'n_estimators': 250, 'learning_rate': 0.05, 'max_depth': 6, 'subsample': 0.7, 'colsample_bytree': 0.7, 'gamma': 0.2, 'early_stopping_rounds': 25},
-    { 'n_estimators': 300, 'learning_rate': 0.08, 'max_depth': 5, 'subsample': 0.9, 'colsample_bytree': 0.9, 'gamma': 0.05, 'early_stopping_rounds': 25},
-    { 'n_estimators': 200, 'learning_rate': 0.15, 'max_depth': 3, 'subsample': 0.75, 'colsample_bytree': 0.75, 'gamma': 0.3, 'early_stopping_rounds': 20},
-    { 'n_estimators': 350, 'learning_rate': 0.03, 'max_depth': 7, 'subsample': 0.65, 'colsample_bytree': 0.65, 'gamma': 0.15, 'early_stopping_rounds': 30},
-]
+# --- 4. Define Model and Hyperparameter Search Space ---
+# Base XGBoost model
+xgb_clf = xgb.XGBClassifier(
+    objective='binary:logistic',
+    scale_pos_weight=scale_pos_weight_value,
+    use_label_encoder=False,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+    # Use early stopping during RandomizedSearchCV fit
+    # eval_metric will be set internally by scorer, but good practice
+    eval_metric='aucpr'
+)
 
-# --- 5. Tuning Loop ---
-results = []
-best_objective_score = -1 # Track highest F0.5 score on validation set
-best_hyperparams = None
-best_model = None
-best_iteration_count = None
+# Hyperparameter distribution for RandomizedSearchCV
+param_dist = {
+    'n_estimators': randint(100, 500),
+    'learning_rate': uniform(0.01, 0.29), # Upper bound is loc + scale = 0.01 + 0.29 = 0.3
+    'max_depth': randint(3, 9), # Tries depths 3 through 8
+    'subsample': uniform(0.6, 0.35), # Range 0.6 to 0.95
+    'colsample_bytree': uniform(0.6, 0.35), # Range 0.6 to 0.95
+    'gamma': uniform(0.0, 0.5),
+    'reg_alpha': uniform(0.0, 0.5), # L1 regularization
+    'reg_lambda': uniform(0.5, 1.5) # L2 regularization (Range 0.5 to 2.0)
+}
 
-print(f"\n--- Starting Local Hyperparameter Search ({len(hyperparameter_sets)} sets) ---")
-print(f"--- Objective: Maximize F0.5 Score on Validation Set (Threshold 0.5) ---")
+# --- 5. Define Scoring Metric for Tuning ---
+# We want to maximize F0.5 score during hyperparameter search
+f05_scorer = make_scorer(fbeta_score, beta=0.5)
+
+# --- 6. Setup Cross-Validation and Randomized Search ---
+# Use Stratified K-Folds for imbalanced data
+cv_strategy = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+
+print(f"\n--- Starting Randomized Search (Iterations={N_ITER_SEARCH}, CV Folds={CV_FOLDS}) ---")
+print(f"--- Optimizing for: F0.5 Score ---")
 start_time = time.time()
 
-for i, params in enumerate(hyperparameter_sets):
-    print(f"\n--- Training Run {i+1}/{len(hyperparameter_sets)} ---")
-    print(f"Hyperparameters: {params}")
-    run_start_time = time.time()
+random_search = RandomizedSearchCV(
+    estimator=xgb_clf,
+    param_distributions=param_dist,
+    n_iter=N_ITER_SEARCH,
+    scoring=f05_scorer, # Use F0.5 score for optimization
+    cv=cv_strategy,
+    n_jobs=-1, # Use all available cores for CV folds if possible
+    verbose=2, # Show progress
+    random_state=RANDOM_STATE,
+    refit=True # Automatically refit the best model on the whole Train+CV data
+)
 
-    try:
-        # Initialize XGBoost Classifier with current hyperparameters
-        xgb_model_tune = xgb.XGBClassifier(
-            objective='binary:logistic',
-            eval_metric='aucpr', # Use AUC-PR for early stopping guidance
-            scale_pos_weight=scale_pos_weight_value,
-            use_label_encoder=False,
-            n_estimators=params['n_estimators'],
-            learning_rate=params['learning_rate'],
-            max_depth=params['max_depth'],
-            subsample=params['subsample'],
-            colsample_bytree=params['colsample_bytree'],
-            gamma=params['gamma'],
-            early_stopping_rounds=params['early_stopping_rounds'],
-            random_state=RANDOM_STATE,
-            n_jobs=-1
-        )
+# Define fit parameters for early stopping within RandomizedSearchCV
+# Need a separate validation split *within* the CV loop for early stopping
+# This is tricky with RandomizedSearchCV directly. A simpler approach for now
+# is to not use early stopping *within* the RandomSearch CV, and rely on n_estimators.
+# Or, provide X_test/y_test just for the *final* refit's early stopping (not ideal).
+# Let's omit early stopping *within* RandomizedSearch for simplicity here,
+# relying on the CV process and n_estimators range.
+# Note: If N_ESTIMATORS is large, this can be slow.
 
-        # Use the VALIDATION set for early stopping
-        eval_set = [(X_val, y_val)]
-
-        print("Training...")
-        xgb_model_tune.fit(
-            X_train, y_train,
-            eval_set=eval_set,
-            verbose=False # Keep logs cleaner during loop
-        )
-        iter_count = xgb_model_tune.best_iteration if hasattr(xgb_model_tune, 'best_iteration') else params['n_estimators']
-        print(f"Training complete (iterations: {iter_count}).")
-
-        # --- Evaluate on VALIDATION set to get the score for tuning ---
-        # We use F0.5 score at default 0.5 threshold here to select the best candidate model
-        y_pred_proba_val = xgb_model_tune.predict_proba(X_val)[:, 1]
-        y_pred_class_val_05 = (y_pred_proba_val >= 0.5).astype(int) # Use 0.5 for F-beta objective calc
-
-        if len(np.unique(y_val)) < 2:
-             print("WARN: Only one class in validation set for this run. Cannot calculate F0.5. Skipping score update.")
-             current_objective_score = -1 # Cannot score
-        else:
-             current_objective_score = fbeta_score(y_val, y_pred_class_val_05, beta=0.5, zero_division=0)
-
-        print(f"Validation F0.5 Score (@0.5 thresh): {current_objective_score:.5f}")
-        results.append({'params': params, 'validation_f0.5_score': current_objective_score, 'iterations': iter_count})
-
-        # Check if this is the best score so far
-        if current_objective_score > best_objective_score:
-            print(f"*** New Best F0.5 Score Found! Previous best: {best_objective_score:.5f} ***")
-            best_objective_score = current_objective_score
-            best_hyperparams = params
-            best_model = xgb_model_tune # Keep the actual trained model object
-            best_iteration_count = iter_count
-
-    except Exception as e:
-        print(f"ERROR during training run {i+1} with params {params}: {e}")
-        results.append({'params': params, 'validation_f0.5_score': -1, 'iterations': -1, 'error': str(e)})
-
-    run_end_time = time.time()
-    print(f"Run {i+1} time: {run_end_time - run_start_time:.2f} seconds.")
+# Fit the Randomized Search
+# Fitting on the Train+CV data. CV splits handle validation internally for scoring.
+random_search.fit(X_train_cv, y_train_cv)
 
 
 total_time = time.time() - start_time
-print(f"\n--- Local Tuning Finished ---")
+print(f"\n--- Randomized Search Finished ---")
 print(f"Total time: {total_time:.2f} seconds")
 
-# --- 6. Post-Tuning: Threshold Adjustment and Final Evaluation ---
+# --- 7. Get Best Model and Hyperparameters ---
+print("\n--- Best Model Found by Randomized Search ---")
+print(f"Best F0.5 Score (averaged across CV folds): {random_search.best_score_:.5f}")
+print("Best Hyperparameters:")
+best_params = random_search.best_params_
+print(json.dumps(best_params, indent=2))
+
+# The best model is already refitted on the entire X_train_cv, y_train_cv data
+best_model = random_search.best_estimator_
+
+# --- 8. Post-Tuning: Threshold Adjustment and Final Evaluation ---
 final_results = {}
 if best_model:
-    print("\n--- Selected Best Model based on Validation F0.5 Score ---")
-    print(f"Best Validation F0.5 Score (@0.5 thresh): {best_objective_score:.5f}")
-    print(f"Achieved at iteration: {best_iteration_count}")
-    print("Best Hyperparameters:")
-    print(json.dumps(best_hyperparams, indent=2))
-
-    # --- Find Optimal Threshold on Validation Set for TARGET PRECISION ---
-    optimal_threshold = find_optimal_threshold(best_model, X_val, y_val, TARGET_PRECISION)
+    # --- Find Optimal Threshold on the *entire* Train+CV Set ---
+    # Since the best model was refit on all Train+CV data, we use that same data
+    # to find the threshold. This assumes the CV process gave us a robust model.
+    # Alternatively, could split off a dedicated validation set *before* CV,
+    # but that reduces training data further. Using the full Train+CV set for
+    # thresholding after refit is a common practice.
+    optimal_threshold = find_optimal_threshold(best_model, X_train_cv, y_train_cv, TARGET_PRECISION)
 
     # --- Evaluate the BEST Model on the Held-Out TEST Set using Optimal Threshold ---
     print("\n--- Evaluating BEST Model on FINAL TEST SET using Optimal Threshold ---")
@@ -291,10 +269,10 @@ if best_model:
 
     # Log final metrics
     final_results = log_metrics(y_test, y_pred_proba_test, y_pred_class_test_tuned, prefix="final_test", threshold=optimal_threshold)
-    final_results['best_hyperparameters'] = best_hyperparams
-    final_results['best_objective_score_on_validation'] = best_objective_score
+    final_results['best_hyperparameters'] = best_params
+    final_results['best_cv_score_f0.5'] = random_search.best_score_
 
-    # --- 7. Save the BEST Model and Threshold ---
+    # --- 9. Save the BEST Model and Threshold ---
     print(f"\n--- Saving Best Model & Threshold ---")
     try:
         joblib.dump(best_model, BEST_MODEL_SAVE_FILE)
@@ -320,6 +298,6 @@ if best_model:
         print(f"ERROR: Could not save final evaluation metrics: {e}")
 
 else:
-    print("ERROR: No successful training runs completed. Could not determine best model.")
+    print("ERROR: RandomizedSearch did not yield a best model.")
 
-print("\n--- Local Simulation Finished ---")
+print("\n--- Local Simulation with RandomizedSearch Finished ---")
