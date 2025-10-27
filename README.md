@@ -1,3 +1,5 @@
+View our Project: https://devpost.com/software/creditguard-7xqyla
+
 Inspiration:
 The driving force behind CreditGuard stems from the growing threat of credit card fraud. The financial losses and decline in customer trust necessitate constant improvement in detection systems to effectively keep pace with evolving fraud. We recognized a critical facet to make our detection different: the difficulty in obtaining large, diverse, and realistic training data that reflects the complex strategies employed by fraudsters. So, this project was inspired by the challenge of creating a dynamic data generation process to empower the development of a highly accurate fraud detection model.
 
